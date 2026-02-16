@@ -1,6 +1,3 @@
-This `README.md` is designed to be visually engaging and professional, reflecting the features and technical logic found in your `code.py`.
-
----
 
 # 🎙️ PARO-Style Patient Monitoring System 🧘‍♂️
 
