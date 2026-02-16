@@ -87,7 +87,7 @@ The system operates on a **Single-Button Toggle** logic (BCM12 to GND):
 
 ## 📁 Data Output Structure
 
-All data is saved to `/Downloads/Muslim Messungen/` in a timestamped folder:
+All data is saved to `/Downloads/Messungen/` in a timestamped folder:
 
 * `Gesamt_raw_daten.raw/wav`: Continuous audio stream.
 * `Paro_raw_daten.raw/wav`: Audio filtered for significant sound levels.
