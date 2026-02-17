@@ -36,9 +36,9 @@ The system uses a 3-pin RGB LED to communicate the current state:
 * **Controller**: Raspberry Pi (with Bluetooth support).
 * **Microcontroller**: ESP32-C6 (Broadcasting as `ESP32C6-PARO`).
 * **Peripherals**:
-* **Button**: Connected to **BCM 12** (GND toggle).
-* **RGB LED**: Pins **BCM 23** (R), **24** (G), **25** (B).
-* **Camera**: Official PiCamera (optional, for Pose Tracking).
+*   **Button**: Connected to **BCM 12** (GND toggle).
+*   **RGB LED**: Pins **BCM 23** (R), **24** (G), **25** (B).
+*   **Camera**: Official PiCamera for Pose Tracking.
 
 
 
