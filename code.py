@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 # -- coding: utf-8 --
 """
-ESP32C6 BLE Recorder — Audio + RGB LED/Button + (optional) Camera Pose (MediaPipe)
+ESP32C6 BLE Patient Monitor Recorder
 
-- RGB LED on BCM23/24/25 (R/G/B) with clear status colors.
-- ONE start/confirm/stop button on BCM12 (to GND; pull-up disabled to match demo v2 behavior).
-- Idle = solid Blue, Searching = Yellow blink, Connected-wait = solid Green,
-  Recording = solid Red (on first audio), Errors = solid distinct colors.
-- Battery low (2.0 V) = solid Violet override for non-error states.
-- Optional camera + MediaPipe Pose tracking (logs JSONL, optional preview window).
-- Graceful if GPIO or Camera libs are missing.
+This script implements a robust BLE-based patient monitoring system for ESP32C6 devices, integrating audio recording, RGB LED status indication, button input, battery monitoring, and optional camera pose tracking (MediaPipe).
 
-NOTE: Button semantics updated to match the simple toggle demo:
-- Count a "press" on ANY state change (HIGH<->LOW), with a simple debounce sleep.
-- No re-check after debounce and no explicit release gating.
+State flow:
+    idle → searching → connected_wait → recording → stop/cleanup
+
+Features:
+    - BLE scanning, connection, notification handling, disconnect recovery, and auto-resume.
+    - RGB LED (BCM23/24/25) for clear status indication: idle (blue), searching (yellow blink), connected_wait (green), recording (red), errors (distinct colors), battery-low (violet override).
+    - Button input (BCM12) for state transitions: start, confirm, stop (any edge, debounced).
+    - Audio buffering, dB calculation, and output to raw, CSV, and WAV files.
+    - Battery-low detection with LED override.
+    - Optional camera pose worker thread (MediaPipe) for JSONL logging and preview.
+    - Manifest and session file lifecycle management.
+    - Graceful handling of missing hardware/libs (GPIO, camera).
+    - Cleanup and post-processing (file closure, WAV conversion) in finally block.
+
+Suitable for engineering/university projects requiring precise hardware interaction, robust state management, and clear data logging.
 """
 
 import asyncio # async event loop for BLE + tasks
@@ -66,6 +72,18 @@ APP_VERSION = "2.0.6"
 
 # ---------------- Session folder & files  ----------------
 def neuer_messordner(base_dir=BASE_DIR):
+    """
+    Create a new session folder with a unique timestamp under the base directory.
+
+    Args:
+        base_dir (str): Base directory for session folders.
+
+    Returns:
+        str: Path to the newly created session folder.
+
+    Raises:
+        OSError: If folder creation fails.
+    """
     os.makedirs(base_dir, exist_ok=True)
     stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
     folder = os.path.join(base_dir, stamp)
@@ -97,13 +115,21 @@ paro_raw_file = None
 paro_db_file = None
 
 def open_session_files():
-    """Create session folder and open all files. Call ONLY once per program run, after user confirmation."""
+    """
+    Create session folder and open all session files for audio, telemetry, pose, and manifest.
+    Call ONLY once per program run, after user confirmation.
+
+    Side Effects:
+        - Creates session folder and files.
+        - Opens file handles for writing.
+        - Initializes CSV headers.
+    """
     global messordner
     global Gesamt_raw_filename, Gesamt_dB_filename, Strom_Spannung_Leistung_filename
     global Paro_raw_filename, Paro_dB_filename, Pose_jsonl_path, Manifest_path
     global Gesamt_raw_file, db_file, strom_file, paro_raw_file, paro_db_file
 
-    # ---> IMPORTANT: only create/open if no session exists yet
+    # Only create/open if no session exists yet
     if messordner is not None:
         return
 
@@ -130,9 +156,16 @@ def open_session_files():
     paro_db_file.write("Datum; Uhrzeit; dB\n"); paro_db_file.flush(); os.fsync(paro_db_file.fileno())
 
 def close_session_files():
+    """
+    Close all open session file handles.
+
+    Side Effects:
+        - Closes files for audio, telemetry, and pose.
+    """
     for f in (Gesamt_raw_file, db_file, strom_file, paro_raw_file, paro_db_file):
         try:
-            if f: f.close()
+            if f:
+                f.close()
         except Exception:
             pass
 
@@ -159,7 +192,15 @@ _manifest = {
 }
 
 def save_manifest(update=None):
-    """Writes manifest ONLY if Manifest_path exists (i.e., session started)."""
+    """
+    Write manifest file with session metadata and statistics.
+
+    Args:
+        update (dict, optional): Key-value pairs to update manifest before saving.
+
+    Side Effects:
+        - Updates manifest file on disk if session started.
+    """
     if update:
         for k, v in update.items():
             _manifest[k] = v
@@ -183,6 +224,15 @@ LED_R, LED_G, LED_B = 23, 24, 25
 LED_ACTIVE_HIGH = True  # True for common-cathode; set False for common-anode.
 
 def _gpio_setup():
+    """
+    Initialize GPIO for RGB LED and button input.
+    Claims output pins for LED and input pin for button.
+    Disables GPIO if initialization fails.
+
+    Side Effects:
+        - Sets up hardware for LED/button.
+        - Updates global handle and USE_GPIO flag.
+    """
     global h, USE_GPIO
     if not USE_GPIO:
         print("[GPIO] lgpio nicht verfügbar → LED/Taster deaktiviert.")
@@ -198,6 +248,16 @@ def _gpio_setup():
         USE_GPIO = False
 
 def _pin_write(pin, on: bool):
+    """
+    Write digital value to a GPIO pin for LED control.
+
+    Args:
+        pin (int): GPIO pin number.
+        on (bool): True for ON, False for OFF.
+
+    Side Effects:
+        - Sets LED state.
+    """
     if not USE_GPIO or h is None:
         return
     val = 1 if on else 0
@@ -207,37 +267,76 @@ def _pin_write(pin, on: bool):
         lgpio.gpio_write(h, pin, val)
     except Exception:
         pass
-#alle led Kanele aus
+#Turn off all RGB LED channels.
 def rgb_off():
-    _pin_write(LED_R, False); _pin_write(LED_G, False); _pin_write(LED_B, False)
+    """
+    Turn off all RGB LED channels.
+    """
+    _pin_write(LED_R, False)
+    _pin_write(LED_G, False)
+    _pin_write(LED_B, False)
 
 def rgb_set_tuple(rgb):
-    # components may be floats 0..1; threshold at >0.5
+    """
+    Set RGB LED state from a tuple of values (0..1).
+
+    Args:
+        rgb (tuple): (R, G, B) values, floats 0..1.
+    """
     r, g, b = (bool(round(min(1, max(0, v)))) for v in rgb)
-    _pin_write(LED_R, r); _pin_write(LED_G, g); _pin_write(LED_B, b)
+    _pin_write(LED_R, r)
+    _pin_write(LED_G, g)
+    _pin_write(LED_B, b)
 
 # Blink manager with clean cancel (no final 'off' race)
 _rgb_tasks = {}  # name -> asyncio.Task
 
 async def _blink_task(name, rgb, period):
+    """
+    Async task to blink RGB LED with given color and period.
+
+    Args:
+        name (str): Task name.
+        rgb (tuple): (R, G, B) values.
+        period (float): Blink period in seconds.
+    """
     try:
         while True:
-            rgb_set_tuple(rgb); await asyncio.sleep(period)
-            rgb_off();          await asyncio.sleep(period)
+            rgb_set_tuple(rgb)
+            await asyncio.sleep(period)
+            rgb_off()
+            await asyncio.sleep(period)
     except asyncio.CancelledError:
         return
 
 def rgb_blink_start(name, rgb, period):
+    """
+    Start blinking RGB LED for a named status.
+
+    Args:
+        name (str): Status name.
+        rgb (tuple): (R, G, B) values.
+        period (float): Blink period.
+    """
     rgb_blink_stop(name)
     task = asyncio.create_task(_blink_task(name, rgb, period))
     _rgb_tasks[name] = task
 
 def rgb_blink_stop(name):
+    """
+    Stop blinking task for a named status.
+
+    Args:
+        name (str): Status name.
+    """
     task = _rgb_tasks.pop(name, None)
     if task and not task.done():
         task.cancel()
 
 def rgb_stop_all():
+    """
+    Stop all active RGB LED blink tasks.
+    """
     for k in list(_rgb_tasks.keys()):
         rgb_blink_stop(k)
 
@@ -257,7 +356,13 @@ _current_status = None
 _battery_low = False
 
 def _gpio_read_btn():
-    #Liest aktuellen Button-Zustand (1/0). Bei Fehler → 1 (keine Taste)
+    """
+    Read current button state (1/0).
+    Returns 1 (no press) on error.
+
+    Returns:
+        int: Button state (1=not pressed, 0=pressed).
+    """
     if USE_GPIO and h is not None:
         try:
             return lgpio.gpio_read(h, BTN_PIN)
@@ -266,14 +371,24 @@ def _gpio_read_btn():
     return 1
 
 def set_battery_low(flag: bool):
-    #Setzt Battery-Low-Flag und aktualisiert Statusanzeige (Violet-Override)
+    """
+    Set battery-low flag and update LED status (violet override for non-error states).
+
+    Args:
+        flag (bool): True if battery is low.
+    """
     global _battery_low
     _battery_low = bool(flag)
     if _current_status:
         set_status(_current_status)  # refresh with override
-#led status
+# Update LED state for the current application status.
 def set_status(name: str):
-    """Stop blinks first, then set LED. Battery-low overrides non-errors."""
+    """
+    Set LED status for a named state. Stops blinks first, applies battery-low override for non-error states.
+
+    Args:
+        name (str): Status name.
+    """
     global _current_status
     _current_status = name
     if not USE_GPIO:
@@ -304,6 +419,15 @@ current_block = 0
 first_audio_seen = False
 
 def berechne_dezibel(samples):
+    """
+    Calculate decibel (dB) value from audio samples.
+
+    Args:
+        samples (array-like): Audio samples (int16).
+
+    Returns:
+        float: dB value, -100.0 if silent.
+    """
     samples = np.array(samples, dtype=np.int16)
     rms = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
     return 20 * np.log10(rms / 32767.0) if rms != 0 else -100.0
@@ -312,6 +436,20 @@ def berechne_dezibel(samples):
 #                       Camera Pose Worker
 # ======================================================================
 class CameraPoseWorker(threading.Thread):
+    """
+    Worker thread for camera pose tracking using MediaPipe.
+    Captures frames, processes pose, logs landmarks to JSONL, and optionally shows preview window.
+
+    Args:
+        start_time (float): Session start time (epoch).
+        session_folder (str): Path to session folder.
+        show_window (bool): If True, show preview window.
+
+    Side Effects:
+        - Opens camera and JSONL file.
+        - Logs pose landmarks.
+        - Updates LED status on error.
+    """
     def __init__(self, start_time, session_folder, show_window=True):
         super().__init__(daemon=True)
         self.t0 = start_time
@@ -323,6 +461,10 @@ class CameraPoseWorker(threading.Thread):
         self.json_file = None
 
     def run(self):
+        """
+        Main worker loop: captures frames, processes pose, logs landmarks, handles preview window.
+        Handles cleanup and error reporting.
+        """
         if not (CAMERA_ENABLED and CAMERA_AVAILABLE):
             return
         try:
@@ -336,7 +478,7 @@ class CameraPoseWorker(threading.Thread):
             )
             self.picam.configure(config)
             self.picam.start()
-            #MediaPpe Pose intialisieren
+            # Initialize MediaPipe Pose
             mp_pose = mp.solutions.pose
             mp_draw = mp.solutions.drawing_utils
             mp_style = mp.solutions.drawing_styles
@@ -418,18 +560,35 @@ class CameraPoseWorker(threading.Thread):
                     cv2.destroyAllWindows()
             except Exception:
                 pass
-#Stop-Signal für den Thread setzen (graceful exit)
+
     def stop(self):
+        """
+        Signal the worker thread to stop gracefully.
+        """
         self.stop_evt.set()
 
 # ======================================================================
 #                 BLE Notification Handler + Battery Low
 # ======================================================================
 BATTERY_LOW_VOLTAGE = 2.0  # per your request
-#Verarbeitet BLE-Notifications (Telemetry-Text ODER Audio-Bytes)
+# Handle BLE notifications containing either telemetry text or raw audio data.
 def notification_handler(sender, data):
+    """
+    Handle BLE notifications for telemetry and audio data.
+
+    Args:
+        sender: BLE sender handle (unused).
+        data (bytes): Notification payload (telemetry or audio).
+
+    Side Effects:
+        - Writes telemetry and audio to session files.
+        - Updates battery-low LED override.
+        - Switches LED to recording on first audio.
+        - Buffers audio, calculates dB, writes to CSV/raw.
+    """
     global audio_samples, current_block, first_audio_seen
-    datum = time.strftime("%d.%m.%Y"); uhrzeit = time.strftime("%H:%M:%S")
+    datum = time.strftime("%d.%m.%Y")
+    uhrzeit = time.strftime("%H:%M:%S")
 
     # Power telemetry (STROM: <mA>;<V>;<mW>)
     try:
@@ -440,7 +599,8 @@ def notification_handler(sender, data):
                 strom, spannung, leistung = parts
                 if strom_file:
                     strom_file.write(f"{datum}; {uhrzeit}; {strom}; {spannung}; {leistung}\n")
-                    strom_file.flush(); os.fsync(strom_file.fileno())
+                    strom_file.flush()
+                    os.fsync(strom_file.fileno())
                 try:
                     v = float(spannung.strip().replace(",", "."))
                     set_battery_low(v < BATTERY_LOW_VOLTAGE)
@@ -462,15 +622,19 @@ def notification_handler(sender, data):
     if Gesamt_raw_file:
         Gesamt_raw_file.write(data)
         # ensure raw hits disk regularly
-        Gesamt_raw_file.flush(); os.fsync(Gesamt_raw_file.fileno())
+        Gesamt_raw_file.flush()
+        os.fsync(Gesamt_raw_file.fileno())
 
     while len(audio_samples) >= BLOCK_SIZE:
         block = np.array(audio_samples[:BLOCK_SIZE], dtype=np.int16)
         db_wert = berechne_dezibel(block)
 
         if db_file:
-            db_file.write(f"{datum}; {uhrzeit}; {db_wert:.2f}\n"); db_file.flush(); os.fsync(db_file.fileno())
+            db_file.write(f"{datum}; {uhrzeit}; {db_wert:.2f}\n")
+            db_file.flush()
+            os.fsync(db_file.fileno())
 
+        # Write to paro files: only if dB > -10, else write silent block
         if db_wert > -10:
             if paro_raw_file:
                 paro_raw_file.write(block.tobytes())
@@ -484,9 +648,11 @@ def notification_handler(sender, data):
                 paro_db_file.write(f"{datum}; {uhrzeit}; 0.00\n")
 
         if paro_raw_file:
-            paro_raw_file.flush(); os.fsync(paro_raw_file.fileno())
+            paro_raw_file.flush()
+            os.fsync(paro_raw_file.fileno())
         if paro_db_file:
-            paro_db_file.flush(); os.fsync(paro_db_file.fileno())
+            paro_db_file.flush()
+            os.fsync(paro_db_file.fileno())
 
         audio_samples = audio_samples[BLOCK_SIZE:]
         current_block += 1
@@ -499,7 +665,13 @@ def notification_handler(sender, data):
 async def wait_for_button_toggle():
     """
     Wait for ANY state change on BTN_PIN (HIGH<->LOW), then return once.
-    Simple debounce like the demo: sleep and accept; no re-check, no release gating.
+    Implements simple debounce: sleep and accept, no re-check or release gating.
+
+    Returns:
+        None
+
+    Side Effects:
+        - Waits for user input via button.
     """
     if not USE_GPIO:
         return
@@ -515,13 +687,21 @@ async def wait_for_button_toggle():
         await asyncio.sleep(poll)
 
 async def scanning_indicator(stop_event: asyncio.Event):
+    """
+    Print animated spinner while scanning for BLE device.
+
+    Args:
+        stop_event (asyncio.Event): Event to signal stop.
+    """
     spinner = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
-    i = 0; t0 = time.time()
+    i = 0
+    t0 = time.time()
     while not stop_event.is_set():
         elapsed = int(time.time() - t0)
         msg = f"\nSuche nach {ESP32_NAME} … {spinner[i % len(spinner)]}  ({elapsed}s)"
         print(msg, end="", flush=True)
-        i += 1; await asyncio.sleep(0.15)
+        i += 1
+        await asyncio.sleep(0.15)
     print("\n" + " " * 60 + "\n", end="", flush=True)
 
 # ======================================================================
@@ -531,6 +711,24 @@ async def scanning_indicator(stop_event: asyncio.Event):
 AUTO_RESUME = False
 
 async def main():
+    """
+    Main async entry point for BLE patient monitor recorder.
+
+    State flow:
+        idle → searching → connected_wait → recording → stop/cleanup
+
+    Handles:
+        - BLE scanning, connection, notification, disconnect, auto-resume
+        - Button input for state transitions
+        - Session file/manifest lifecycle
+        - Camera pose worker thread
+        - Cleanup and post-processing (WAV conversion)
+
+    Side Effects:
+        - Hardware interaction (GPIO, BLE, camera)
+        - File creation, logging, closure
+        - LED status updates
+    """
     global AUTO_RESUME, first_audio_seen, audio_samples, current_block
     global messordner, auto_resume_count
     _gpio_setup()
@@ -562,14 +760,17 @@ async def main():
             )
 
             if cancel_task in done:
-                stop_scan.set(); await indicator_task
-                for t in pending: t.cancel()
+                stop_scan.set()
+                await indicator_task
+                for t in pending:
+                    t.cancel()
                 print("[INPUT] Suche abgebrochen per Taste. Beende …")
                 user_abort_search = True
                 break
 
             cancel_task.cancel()
-            stop_scan.set(); await indicator_task
+            stop_scan.set()
+            await indicator_task
 
             target = None
             try:
@@ -577,7 +778,8 @@ async def main():
                 target = next((d for d in devices if d.name and ESP32_NAME in d.name), None)
             except Exception as e:
                 print(f"[SCAN] Fehler: {e} → retry in 3s")
-                set_status("err_general"); await asyncio.sleep(3)
+                set_status("err_general")
+                await asyncio.sleep(3)
                 set_status("searching")
                 continue
 
@@ -666,7 +868,11 @@ async def main():
 
                 # THIRD TOGGLE to stop
                 async def stop_on_button_toggle_after_confirm():
-                    debounce_sec = 0.20; poll = 0.02
+                    """
+                    Wait for button toggle after confirmation to stop recording.
+                    """
+                    debounce_sec = 0.20
+                    poll = 0.02
                     last = _gpio_read_btn()
                     while True:
                         cur = _gpio_read_btn()
@@ -722,7 +928,8 @@ async def main():
         # Stop camera
         try:
             if 'cam_worker' in locals() and cam_worker is not None:
-                cam_worker.stop(); cam_worker.join(timeout=2.0)
+                cam_worker.stop()
+                cam_worker.join(timeout=2.0)
         except Exception:
             pass
 
@@ -743,7 +950,7 @@ async def main():
         except Exception:
             pass
 
-        # ---------- Nachbearbeitung: RAW → WAV (only if session started) ----------
+        # ---------- Post-processing: RAW → WAV (only if session started) ----------
         try:
             if messordner and Paro_raw_filename and os.path.exists(Paro_raw_filename):
                 raw_paro = np.fromfile(Paro_raw_filename, dtype=np.int16)
