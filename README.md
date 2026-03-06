@@ -1,6 +1,3 @@
-This `README.md` is designed to be visually engaging and professional, reflecting the features and technical logic found in your `code.py`.
-
----
 
 # 🎙️ PARO-Style Patient Monitoring System 🧘‍♂️
 
@@ -39,9 +36,9 @@ The system uses a 3-pin RGB LED to communicate the current state:
 * **Controller**: Raspberry Pi (with Bluetooth support).
 * **Microcontroller**: ESP32-C6 (Broadcasting as `ESP32C6-PARO`).
 * **Peripherals**:
-* **Button**: Connected to **BCM 12** (GND toggle).
-* **RGB LED**: Pins **BCM 23** (R), **24** (G), **25** (B).
-* **Camera**: Official PiCamera (optional, for Pose Tracking).
+*   **Button**: Connected to **BCM 12** (GND toggle).
+*   **RGB LED**: Pins **BCM 23** (R), **24** (G), **25** (B).
+*   **Camera**: Official PiCamera for Pose Tracking.
 
 
 
@@ -90,7 +87,7 @@ The system operates on a **Single-Button Toggle** logic (BCM12 to GND):
 
 ## 📁 Data Output Structure
 
-All data is saved to `/Downloads/Muslim Messungen/` in a timestamped folder:
+All data is saved to `/Downloads/Messungen/` in a timestamped folder:
 
 * `Gesamt_raw_daten.raw/wav`: Continuous audio stream.
 * `Paro_raw_daten.raw/wav`: Audio filtered for significant sound levels.
